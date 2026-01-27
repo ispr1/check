@@ -22,3 +22,7 @@ class Company(Base):
     verification_requests = relationship(
         "VerificationRequest", back_populates="company", cascade="all, delete-orphan"
     )
+    verifications = relationship(
+        "Verification", back_populates="company", cascade="all, delete-orphan"
+    )
+

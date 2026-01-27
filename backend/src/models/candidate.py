@@ -35,6 +35,10 @@ class Candidate(Base):
     verification_requests = relationship(
         "VerificationRequest", back_populates="candidate", cascade="all, delete-orphan"
     )
+    # One-to-one relationship with Verification
+    verification = relationship(
+        "Verification", back_populates="candidate", uselist=False, cascade="all, delete-orphan"
+    )
 
     # Unique constraint: email + company_id
     __table_args__ = (

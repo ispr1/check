@@ -11,7 +11,7 @@ from typing import Optional
 from datetime import datetime
 
 from .client import get_surepass_client
-from .exceptions import SurepassInvalidInputError
+from .exceptions import SurepassInvalidInputError, SurepassNotAvailableError
 from . import mock_responses
 
 logger = logging.getLogger(__name__)
@@ -60,11 +60,26 @@ class PANService:
             logger.info(f"Mock: Verifying PAN XXXXX{cleaned_pan[5:9]}X")
             response = mock_responses.mock_pan_verification(cleaned_pan, name, dob)["data"]
         else:
-            response = self.client.post("pan-verification", {
-                "pan_number": cleaned_pan,
-                "name": name,
-                "dob": dob
-            })
+            try:
+                response = self.client.post("pan-verification", {
+                    "pan_number": cleaned_pan,
+                    "name": name,
+                    "dob": dob
+                })
+            except SurepassNotAvailableError as e:
+                # Graceful degradation - API endpoint not available
+                logger.warning(f"PAN API not available: {e.message}")
+                return {
+                    "status": "NOT_AVAILABLE",
+                    "score": 0,
+                    "message": "PAN verification service temporarily unavailable",
+                    "details": {
+                        "pan_number": cleaned_pan,
+                        "error": "API_NOT_AVAILABLE",
+                        "reason": "Surepass endpoint not configured",
+                    },
+                    "verified_at": None,
+                }
         
         return self._process_response(response, cleaned_pan)
     

@@ -12,7 +12,7 @@ from dateutil.parser import parse as parse_date
 from dateutil.relativedelta import relativedelta
 
 from .client import get_surepass_client
-from .exceptions import SurepassInvalidInputError
+from .exceptions import SurepassInvalidInputError, SurepassNotAvailableError
 from . import mock_responses
 
 logger = logging.getLogger(__name__)
@@ -52,9 +52,18 @@ class UANService:
             logger.info(f"Mock: Verifying UAN XXXX-XXXX-{cleaned[-4:]}")
             return mock_responses.mock_uan_verification(cleaned)["data"]
         
-        response = self.client.post("uan-verification", {
-            "uan_number": cleaned
-        })
+        try:
+            response = self.client.post("uan-verification", {
+                "uan_number": cleaned
+            })
+        except SurepassNotAvailableError as e:
+            logger.warning(f"UAN API not available: {e.message}")
+            return {
+                "status": "NOT_AVAILABLE",
+                "message": "UAN verification service temporarily unavailable",
+                "error": "API_NOT_AVAILABLE",
+                "establishments": [],
+            }
         
         return response
     

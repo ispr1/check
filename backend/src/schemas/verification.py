@@ -235,3 +235,66 @@ class StepVerificationResponse(BaseModel):
     verification_result: VerificationComparisonResult
     message: str
 
+
+# ============ Phase 3: Face Verification Schemas ============
+
+class FaceDecisionSchema(str, Enum):
+    """Face comparison decision."""
+    MATCH = "MATCH"
+    LOW_CONFIDENCE = "LOW_CONFIDENCE"
+    MISMATCH = "MISMATCH"
+    PENDING_REFERENCE = "PENDING_REFERENCE"
+    NOT_AVAILABLE = "NOT_AVAILABLE"
+    ERROR = "ERROR"
+
+
+class ReferenceSourceSchema(str, Enum):
+    """Source of face reference image."""
+    HR_UPLOAD = "hr_upload"
+    AADHAAR = "aadhaar"
+    ID_CARD = "id_card"
+    OTHER = "other"
+
+
+class FaceSubmission(BaseModel):
+    """Face verification submission from candidate."""
+    selfie_image_base64: str = Field(
+        ..., 
+        description="Base64 encoded selfie image (JPEG/PNG)"
+    )
+
+
+class FaceReferenceUpload(BaseModel):
+    """HR uploads reference image for comparison."""
+    reference_image_base64: str = Field(
+        ...,
+        description="Base64 encoded reference image"
+    )
+    source: ReferenceSourceSchema = Field(
+        default=ReferenceSourceSchema.HR_UPLOAD,
+        description="Source of reference image"
+    )
+
+
+class FaceComparisonResponse(BaseModel):
+    """Response from face comparison - HR safe view."""
+    id: int
+    decision: FaceDecisionSchema
+    confidence_score: float = Field(..., ge=0, le=100)
+    reference_source: Optional[ReferenceSourceSchema] = None
+    selfie_url: Optional[str] = Field(None, description="Presigned URL for selfie")
+    reference_url: Optional[str] = Field(None, description="Presigned URL for reference")
+    flags: List[str] = Field(default_factory=list)
+    compared_at: Optional[datetime] = None
+    message: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class FaceStepResponse(BaseModel):
+    """Response after face step submission."""
+    step_type: StepTypeSchema = StepTypeSchema.FACE_LIVENESS
+    status: StepStatusSchema
+    comparison: Optional[FaceComparisonResponse] = None
+    message: str

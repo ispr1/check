@@ -51,3 +51,24 @@ class SurepassRateLimitError(SurepassError):
             message="Surepass rate limit exceeded - try again later",
             status_code=429
         )
+
+
+class SurepassNotAvailableError(SurepassError):
+    """
+    Raised when Surepass API endpoint is not available (404).
+    
+    This indicates:
+    - Endpoint path is incorrect (needs Surepass support)
+    - API access not yet provisioned
+    - Sandbox not fully configured
+    
+    Verification step should be marked as NOT_AVAILABLE, not FAILED.
+    """
+    
+    def __init__(self, endpoint: str):
+        super().__init__(
+            message=f"Surepass endpoint not available: {endpoint}",
+            status_code=404
+        )
+        self.endpoint = endpoint
+

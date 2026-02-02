@@ -20,6 +20,7 @@ from .exceptions import (
     SurepassTimeoutError,
     SurepassAuthError,
     SurepassRateLimitError,
+    SurepassNotAvailableError,
 )
 
 # Configure module logger
@@ -109,7 +110,11 @@ class SurepassClient:
                 logger.info(f"Surepass response: {response.status_code}")
                 
                 # Handle HTTP errors
-                if response.status_code == 401:
+                if response.status_code == 404:
+                    # Endpoint not available - graceful degradation
+                    logger.warning(f"Surepass endpoint not available (404): {endpoint}")
+                    raise SurepassNotAvailableError(endpoint)
+                elif response.status_code == 401:
                     raise SurepassAuthError()
                 elif response.status_code == 429:
                     raise SurepassRateLimitError()

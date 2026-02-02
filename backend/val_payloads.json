@@ -1,0 +1,18 @@
+{
+  "aadhaar_generate": {
+    "timestamp": "2026-01-28T16:51:30.831909",
+    "url": "https://sandbox.surepass.io/api/v1/aadhaar-v2/generate-otp",
+    "request_masked": {
+      "id_number": "XXXXXXXX4577"
+    },
+    "response_status": 401,
+    "response": {
+      "data": null,
+      "error": null,
+      "message": "Your access token is not valid for this API/Scope. Please contact support for help.",
+      "status_code": 401,
+      "success": false,
+      "message_code": "invalid_token"
+    }
+  }
+}

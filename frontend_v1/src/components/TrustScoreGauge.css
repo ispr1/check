@@ -1,0 +1,30 @@
+.trust-score-gauge {
+    position: relative;
+    width: 100%;
+    max-width: 300px;
+    margin: 0 auto;
+}
+
+.gauge-score {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -20%);
+    text-align: center;
+}
+
+.score-value {
+    font-size: 48px;
+    font-weight: 700;
+    color: #1a202c;
+    line-height: 1;
+}
+
+.score-label {
+    font-size: 14px;
+    color: #718096;
+    margin-top: 8px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}

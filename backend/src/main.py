@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .routers import auth, candidates, verification_requests, verifications, verify_public
+from .api.routes.face import router as face_router
 
 # Configure logging
 logging.basicConfig(
@@ -78,7 +79,7 @@ validate_environment()
 app = FastAPI(
     title="Check360 API",
     description="Background Check Management System - Verification Orchestrator",
-    version="2.5.0",
+    version="3.0.0",
 )
 
 # CORS middleware
@@ -96,13 +97,26 @@ app.include_router(candidates.router, prefix="/api/v1")
 app.include_router(verification_requests.router, prefix="/api/v1")
 app.include_router(verifications.router, prefix="/api/v1")
 app.include_router(verify_public.router, prefix="/api/v1")
+app.include_router(face_router, prefix="/api/v1")
+
+# Phase 4: Document Analysis
+from .api.routes.documents import router as documents_router
+app.include_router(documents_router, prefix="/api/v1")
+
+# Phase 5: Trust Score
+from .api.routes.trust_score import router as trust_score_router
+app.include_router(trust_score_router, prefix="/api/v1")
+
+# Phase 6: HR Review
+from .api.routes.hr import router as hr_router
+app.include_router(hr_router, prefix="/api/v1")
 
 
 @app.get("/")
 async def root():
     return {
         "message": "Check360 API is running",
-        "version": "2.5.0",
+        "version": "4.0.0",
         "description": "Verification Orchestrator + Truth Comparator + Audit Engine"
     }
 

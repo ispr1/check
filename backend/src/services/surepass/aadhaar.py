@@ -12,7 +12,7 @@ from typing import Optional
 from datetime import datetime
 
 from .client import get_surepass_client
-from .exceptions import SurepassError, SurepassInvalidInputError
+from .exceptions import SurepassError, SurepassInvalidInputError, SurepassNotAvailableError
 from . import mock_responses
 
 logger = logging.getLogger(__name__)
@@ -58,9 +58,18 @@ class AadhaarService:
             logger.info(f"Mock: Generating OTP for Aadhaar XXXX-XXXX-{cleaned[-4:]}")
             return mock_responses.mock_aadhaar_generate_otp(cleaned)["data"]
         
-        response = self.client.post("aadhaar-v2/generate-otp", {
-            "id_number": cleaned
-        })
+        try:
+            response = self.client.post("aadhaar-v2/generate-otp", {
+                "id_number": cleaned
+            })
+        except SurepassNotAvailableError as e:
+            logger.warning(f"Aadhaar OTP API not available: {e.message}")
+            return {
+                "status": "NOT_AVAILABLE",
+                "client_id": None,
+                "message": "Aadhaar verification service temporarily unavailable",
+                "error": "API_NOT_AVAILABLE",
+            }
         
         return response
     
@@ -82,10 +91,18 @@ class AadhaarService:
             logger.info(f"Mock: Submitting OTP for client_id {client_id}")
             return mock_responses.mock_aadhaar_submit_otp(client_id, otp)["data"]
         
-        response = self.client.post("aadhaar-v2/submit-otp", {
-            "client_id": client_id,
-            "otp": otp
-        })
+        try:
+            response = self.client.post("aadhaar-v2/submit-otp", {
+                "client_id": client_id,
+                "otp": otp
+            })
+        except SurepassNotAvailableError as e:
+            logger.warning(f"Aadhaar submit OTP API not available: {e.message}")
+            return {
+                "status": "NOT_AVAILABLE",
+                "message": "Aadhaar verification service temporarily unavailable",
+                "error": "API_NOT_AVAILABLE",
+            }
         
         return response
     

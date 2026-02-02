@@ -1,0 +1,22 @@
+============================================================
+  Testing OFFICIAL Sandbox URL from Docs
+============================================================
+
+Base URL: https://sandbox.surepass.io/api/v1
+API Key: eyJhbGciOiJIUzI1NiIsInR5cCI6Ik...
+
+[1] PAN Comprehensive: https://sandbox.surepass.io/api/v1/identity/pan-comprehensive
+    Payload: {'id_number': 'AMXPI3907M'}
+    Status: 404
+    Response: <!doctype html>
+<html lang=en>
+<title>404 Not Found</title>
+<h1>Not Found</h1>
+<p>The requested URL was not found on the server. If you entered the URL manually please check your spelling and try again.</p>
+
+
+[2] Aadhaar OTP Generate: https://sandbox.surepass.io/api/v1/aadhaar-v2/generate-otp
+    Payload: {'id_number': '726944944577'}
+    Status: 401
+    Response: {"data": null, "error": null, "message": "Your access token is not valid for this API/Scope. Please contact support for help.", "status_code": 401, "success": false, "message_code": "invalid_token"}
+

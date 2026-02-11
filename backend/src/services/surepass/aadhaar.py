@@ -184,6 +184,65 @@ class AadhaarService:
         }
 
 
+    def initiate_digilocker_flow(self, redirect_url: str) -> dict:
+        """
+        Initialize DigiLocker session for Aadhaar verification.
+        
+        Args:
+            redirect_url: URL where user should be redirected after DigiLocker flow
+            
+        Returns:
+            dict containing client_id, token, and redirect url
+        """
+        if "localhost" in redirect_url or "127.0.0.1" in redirect_url:
+            logger.warning(
+                f"Aadhaar DigiLocker initiation with local redirect_url: {redirect_url}. "
+                "Note: Surepass Production APIs usually reject localhost/127.0.0.1 and return 403 Forbidden. "
+                "Consider using a tunnel (ngrok) for local testing."
+            )
+
+        if self.client.is_mock_mode():
+            logger.info("Mock: Initializing DigiLocker flow")
+            return {
+                "client_id": "mock_client_id",
+                "url": redirect_url + "?status=success&client_id=mock_client_id",
+                "expiry_seconds": 1800
+            }
+            
+        try:
+            response = self.client.post("digilocker/initialize", {
+                "data": {
+                    "signup_flow": True,
+                    "redirect_url": redirect_url
+                }
+            })
+            return response.get("data", response)
+        except SurepassNotAvailableError as e:
+            logger.warning(f"DigiLocker init failed: {e.message}")
+            raise
+            
+    def fetch_digilocker_data(self, client_id: str) -> dict:
+        """
+        Fetch verified Aadhaar data using DigiLocker client_id.
+        
+        Args:
+            client_id: The client_id from initialization
+            
+        Returns:
+            Verified Aadhaar data
+        """
+        if self.client.is_mock_mode():
+            logger.info(f"Mock: Fetching DigiLocker data for {client_id}")
+            return mock_responses.mock_aadhaar_submit_otp(client_id, "123456")["data"]
+            
+        try:
+            # Response is typically the data directly or wrapped
+            response = self.client.get(f"digilocker/download-aadhaar/{client_id}")
+            return response
+        except SurepassNotAvailableError as e:
+            logger.warning(f"DigiLocker fetch failed: {e.message}")
+            raise
+
 # Singleton instance
 _service_instance: Optional[AadhaarService] = None
 

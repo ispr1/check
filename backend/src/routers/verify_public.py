@@ -38,10 +38,14 @@ from ..schemas.verification import (
     AadhaarOTPRequest,
     AadhaarOTPSubmitRequest,
     AadhaarOTPResponse,
+    AadhaarDigiLockerInitRequest,
+    AadhaarDigiLockerResponse,
+    AadhaarDigiLockerCompleteRequest,
     PANVerificationRequest,
     UANVerificationRequest,
     StepVerificationResponse,
     VerificationComparisonResult,
+    CandidatePublicProfile,
 )
 from ..services.surepass import (
     AadhaarService,
@@ -52,11 +56,81 @@ from ..services.surepass import (
 )
 from ..services.surepass.aadhaar import get_aadhaar_service
 from ..services.surepass.pan import get_pan_service
-from ..services.surepass.uan import get_uan_service
+from ..services.face.rekognition import RekognitionProvider
+
+# Duplicate removal complete
+from ..utils.face_storage import get_face_storage
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/verify", tags=["Candidate Verification"])
+
+
+async def _run_face_comparison(
+    verification: Verification,
+    face_step: VerificationStep,
+    selfie_key: str,
+    reference_key: str,
+    db: Session,
+):
+    """
+    Run face comparison between selfie and reference.
+    Updates face_step status and metadata.
+    """
+    try:
+        storage = get_face_storage()
+        rekognition = RekognitionProvider()
+        
+        # Get images
+        selfie_bytes = storage.get_image(selfie_key)
+        reference_bytes = storage.get_image(reference_key)
+        
+        if not selfie_bytes or not reference_bytes:
+            logger.error(f"Missing image bytes for verification {verification.id}")
+            return
+
+        # Run comparison
+        result = rekognition.compare_faces(
+            source_bytes=selfie_bytes,
+            target_bytes=reference_bytes,
+            source_key=selfie_key,
+            target_key=reference_key,
+        )
+        
+        # Update step based on result
+        face_step.score_contribution = result.confidence_score
+        
+        # Update metadata
+        input_data = face_step.input_data or {}
+        input_data.update({
+            "comparison_status": result.decision.value,
+            "confidence_score": result.confidence_score,
+            "flags": result.flags,
+            "compared_at": result.compared_at.isoformat(),
+            "reference_source": result.reference_source.value,
+        })
+        face_step.input_data = input_data
+        
+        # Mark step status
+        if result.decision.value == "MATCH":
+            face_step.status = StepStatus.COMPLETED
+            logger.info(f"Face MATCH for verification {verification.id} ({result.confidence_score}%)")
+        elif result.decision.value == "MISMATCH":
+            # We mark as COMPLETED even on mismatch so user can proceed to next steps.
+            # The mismatch is flagged in metadata for HR review.
+            face_step.status = StepStatus.COMPLETED
+            logger.warning(f"Face MISMATCH for verification {verification.id} ({result.confidence_score}%)")
+        else:
+            # Low confidence / Review needed
+            face_step.status = StepStatus.COMPLETED
+            logger.warning(f"Face LOW_CONFIDENCE for verification {verification.id} ({result.confidence_score}%)")
+            
+        db.commit()
+        
+    except Exception as e:
+        logger.error(f"Face comparison failed for verification {verification.id}: {e}")
+        # Don't fail the request, just log error
+
 
 
 def get_verification_by_token(token: str, db: Session) -> Verification:
@@ -136,6 +210,7 @@ def _build_session_response(verification: Verification) -> CandidateVerification
             is_mandatory=step.is_mandatory,
             status=step.status,
             completed_at=step.completed_at,
+            metadata=step.input_data  # Mapped input_data to metadata
         )
         for step in verification.steps
     ]
@@ -143,6 +218,10 @@ def _build_session_response(verification: Verification) -> CandidateVerification
     return CandidateVerificationSession(
         status=verification.status,
         token_expires_at=verification.token_expires_at,
+        candidate=CandidatePublicProfile(
+            full_name=verification.candidate.full_name,
+            email=verification.candidate.email, # Ensure model has email
+        ),
         steps=steps,
         next_step=get_next_pending_step(verification),
         can_submit=can_submit_verification(verification),
@@ -169,6 +248,20 @@ async def get_verification_session(
     - Whether submission is allowed
     """
     verification = get_verification_by_token(token, db)
+    
+    # Self-healing: Ensure mandatory steps exist if in initial states
+    if not verification.steps and verification.status in [VerificationStatus.CREATED, VerificationStatus.LINK_SENT, VerificationStatus.IN_PROGRESS]:
+        logger.warning(f"Verification {verification.id} has no steps. Re-initializing mandatory steps.")
+        for step_type in MANDATORY_STEPS:
+            step = VerificationStep(
+                verification_id=verification.id,
+                step_type=step_type,
+                is_mandatory=True,
+                status=StepStatus.PENDING,
+            )
+            db.add(step)
+        db.commit()
+        db.refresh(verification)
     
     # Transition to IN_PROGRESS if this is first access
     if verification.status == VerificationStatus.LINK_SENT:
@@ -200,7 +293,14 @@ async def submit_personal_info(
             message="Personal info already submitted.",
         )
     
-    # Store the input data
+    # Update Candidate Profile
+    candidate = verification.candidate
+    candidate.full_name = data.full_name
+    candidate.dob = data.dob
+    candidate.email = data.email
+    # Phone if needed, but usually phone is verified separately or assumed valid
+    
+    # Store the input data (including address/parents)
     step.mark_completed(input_data=data.model_dump())
     
     # Ensure status is IN_PROGRESS
@@ -241,8 +341,20 @@ async def submit_face_liveness(
             message="Face liveness already submitted.",
         )
     
-    # Store the data (actual verification in Phase 3)
-    step.mark_completed(input_data={"selfie_submitted": True})
+    # Save Selfie to Storage
+    storage = get_face_storage()
+    try:
+        candidate_id = verification.candidate_id
+        selfie_key = storage.save_selfie(candidate_id, data.selfie_image_base64)
+    except Exception as e:
+        logger.error(f"Failed to save selfie: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save selfie image.")
+
+    # Update Step with storage key
+    step.mark_completed(input_data={
+        "selfie_submitted": True,
+        "source_key": selfie_key
+    })
     
     if verification.status == VerificationStatus.LINK_SENT:
         verification.status = VerificationStatus.IN_PROGRESS
@@ -251,7 +363,7 @@ async def submit_face_liveness(
     
     return StepSubmissionResponse(
         step_type=StepTypeSchema.FACE_LIVENESS,
-        status=StepStatusSchema.COMPLETED,
+        status=StepStatusSchema.COMPLETED, # Or based on comparison result if immediate
         message="Face liveness submitted successfully.",
     )
 
@@ -469,6 +581,224 @@ async def submit_aadhaar_otp(
         )
 
 
+# ============ Phase 2: Aadhaar DigiLocker Flow (Production) ============
+
+@router.post(
+    "/{token}/aadhaar/initiate",
+    response_model=AadhaarDigiLockerResponse,
+    summary="Initiate Aadhaar DigiLocker flow",
+    description="Start DigiLocker session and get redirect URL.",
+)
+async def initiate_aadhaar_digilocker(
+    token: str,
+    data: AadhaarDigiLockerInitRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Start DigiLocker verification flow.
+    Replaces the OTP flow for production.
+    """
+    verification = get_verification_by_token(token, db)
+    step = get_step_by_type(verification, StepType.AADHAAR)
+    
+    if step.status == StepStatus.COMPLETED:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Aadhaar already verified.",
+        )
+    
+    try:
+        aadhaar_service = get_aadhaar_service()
+        
+        # Initiate session
+        result = aadhaar_service.initiate_digilocker_flow(data.redirect_url)
+        
+        # Store client_id in step
+        step.input_data = {
+            "client_id": result.get("client_id"),
+            "token": result.get("token"),
+            "initiated_at": datetime.utcnow().isoformat(),
+            "status": "awaiting_redirect"
+        }
+        
+        if verification.status == VerificationStatus.LINK_SENT:
+            verification.status = VerificationStatus.IN_PROGRESS
+        
+        db.commit()
+        db.refresh(step)
+        
+        logger.info(f"Initiated Aadhaar DigiLocker session for step {step.id}: {step.input_data}")
+        
+        return AadhaarDigiLockerResponse(
+            client_id=result.get("client_id"),
+            url=result.get("url"),
+            expiry_seconds=result.get("expiry_seconds", 1800),
+            message="DigiLocker session initiated.",
+        )
+        
+    except SurepassError as e:
+        logger.error(f"Surepass error in initiate_aadhaar: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Unable to initiate DigiLocker. Please try again.",
+        )
+
+
+@router.post(
+    "/{token}/aadhaar/complete",
+    response_model=StepVerificationResponse,
+    summary="Complete Aadhaar verification (DigiLocker)",
+    description="Fetch data from DigiLocker after user returns, and verify identity.",
+)
+async def complete_aadhaar_digilocker(
+    token: str,
+    data: Optional[AadhaarDigiLockerCompleteRequest] = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Complete Aadhaar verification after DigiLocker redirect.
+    """
+    logger.info(f"Received Aadhaar completion request for token: {token}")
+    verification = get_verification_by_token(token, db)
+    step = get_step_by_type(verification, StepType.AADHAAR)
+    
+    if step.status == StepStatus.COMPLETED:
+        if step.input_data and step.input_data.get("comparison"):
+            return StepVerificationResponse(
+                step_type=StepTypeSchema.AADHAAR,
+                status=StepStatusSchema.COMPLETED,
+                verification_result=VerificationComparisonResult(
+                    status="VERIFIED",
+                    score=step.score_contribution or 100,
+                    details=step.input_data["comparison"],
+                    verified_at=step.completed_at,
+                ),
+                message="Aadhaar already verified.",
+            )
+    
+    # Get stored client_id
+    client_id = data.client_id if data and data.client_id else None
+    if not client_id:
+        client_id = step.input_data.get("client_id") if step.input_data else None
+    
+    if not client_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No active DigiLocker session found. Please initiate first.",
+        )
+        
+    try:
+        aadhaar_service = get_aadhaar_service()
+        logger.info(f"Fetching DigiLocker data for client_id: {client_id}")
+        
+        # Fetch data
+        response = aadhaar_service.fetch_digilocker_data(client_id)
+        
+        # DEBUG: Log exact type and snippet
+        logger.info(f"Aadhaar service response type: {type(response)}")
+        with open("aadhaar_debug.txt", "w") as f:
+            f.write(f"Type: {type(response)}\n")
+            f.write(f"Content: {str(response)[:1000]}\n")
+
+        # Robust unwrapping: handle lists and dicts
+        surepass_data = None
+        if isinstance(response, list) and len(response) > 0:
+            logger.info("Aadhaar response is a list, taking first element")
+            response = response[0]
+            
+        if isinstance(response, dict):
+            if "data" in response:
+                surepass_data = response["data"]
+            elif "aadhaar_xml_data" in response:
+                # FIX: Extract the nested dictionary instead of keeping the root
+                surepass_data = response["aadhaar_xml_data"]
+            else:
+                surepass_data = response
+        
+        # Ensure we have a dict before proceeding
+        if not isinstance(surepass_data, dict):
+            type_name = type(response).__name__ if response is not None else "NoneType"
+            logger.error(f"Unexpected response type from Aadhaar service: {type_name}")
+            raise SurepassError(f"Aadhaar service returned empty or invalid data (Type: {type_name}). Please try Re-connecting.")
+
+        # SAVE ASAP: Ensure we store the raw data even if comparison fails
+        step.raw_response = surepass_data
+        db.commit()
+        
+        logger.info(f"Processing Aadhaar data. Keys: {list(surepass_data.keys())}")
+
+        # Validate basic data presence
+        if not any(k in surepass_data for k in ["full_name", "name", "aadhaar_xml_data"]):
+             logger.warning(f"Surepass data missing primary identification keys. Data: {surepass_data}")
+
+        # Compare
+        candidate = verification.candidate
+        comparison = aadhaar_service.compare(
+            surepass_data=surepass_data,
+            candidate_name=candidate.full_name,
+            candidate_dob=str(candidate.dob) if candidate.dob else "",
+        )
+        
+        logger.info(f"Aadhaar comparison complete: {comparison['status']} (Score: {comparison['score']})")
+
+        # Update Status
+        if comparison["status"] in ["VERIFIED", "PARTIAL"]:
+            step.status = StepStatus.COMPLETED
+        else:
+            step.status = StepStatus.FAILED
+            
+        step.completed_at = datetime.utcnow()
+        step.score_contribution = comparison["score"]
+        
+        # Save Aadhaar Photo as Reference
+        reference_key = None
+        if "profile_image" in surepass_data.get("aadhaar_xml_data", {}):
+            try:
+                storage = get_face_storage()
+                raw_image = surepass_data["aadhaar_xml_data"]["profile_image"]
+                reference_key = storage.save_reference(
+                    verification.candidate_id, 
+                    raw_image, 
+                    source="aadhaar"
+                )
+            except Exception as e:
+                logger.error(f"Failed to save Aadhaar reference photo: {e}")
+
+        step.input_data = {
+            **(step.input_data or {}),
+            "verified": True,
+            "comparison": comparison["details"],
+            "status": "completed",
+            "reference_key": reference_key
+        }
+        step.raw_response = surepass_data
+        
+        db.commit()
+        db.refresh(step)
+        
+        return StepVerificationResponse(
+            step_type=StepTypeSchema.AADHAAR,
+            status=step.status,
+            verification_result=VerificationComparisonResult(
+                status=comparison["status"],
+                score=comparison["score"],
+                details=comparison["details"],
+                verified_at=datetime.utcnow(),
+            ),
+            message=f"Aadhaar verification {comparison['status'].lower()}.",
+        )
+        
+    except Exception as e:
+        import traceback
+        logger.error(f"CRITICAL ERROR in complete_aadhaar: {str(e)}")
+        logger.error(traceback.format_exc())
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Internal Server Error: {str(e)}"
+        )
+
+
 @router.post(
     "/{token}/pan",
     response_model=StepVerificationResponse,
@@ -477,7 +807,7 @@ async def submit_aadhaar_otp(
 )
 async def submit_pan(
     token: str,
-    data: PANSubmission,
+    data: PANVerificationRequest,
     db: Session = Depends(get_db),
 ):
     """
@@ -501,73 +831,33 @@ async def submit_pan(
             message="PAN already verified.",
         )
     
-    # Get Aadhaar step to retrieve verified name/DOB
-    aadhaar_step = get_step_by_type(verification, StepType.AADHAAR)
+    # SKIP VERIFICATION (User Request: Store only)
+    # comparison = pan_service.verify(data.pan_number, aadhaar_name, aadhaar_dob)
     
-    # Get verified name/DOB from Aadhaar (or candidate profile)
-    candidate = verification.candidate
-    aadhaar_name = candidate.full_name
-    aadhaar_dob = str(candidate.dob) if candidate.dob else ""
+    # Store Input Only
+    step.input_data = {
+        "pan_number": data.pan_number,
+        "verified": False, # pending batch verification
+        "status": "pending"
+    }
+    step.status = StepStatus.COMPLETED
+    step.score_contribution = 0 # No score yet
+    step.completed_at = datetime.utcnow()
     
-    # If Aadhaar was verified, try to get the verified data
-    if aadhaar_step.raw_response:
-        aadhaar_name = aadhaar_step.raw_response.get("full_name", aadhaar_name)
-        aadhaar_dob = aadhaar_step.raw_response.get("dob", aadhaar_dob)
-    
-    try:
-        pan_service = get_pan_service()
-        result = pan_service.verify(
-            pan_number=data.pan_number,
-            name=aadhaar_name,
-            dob=aadhaar_dob,
-        )
-        
-        # Determine step status
-        if result["status"] == "VERIFIED":
-            step.status = StepStatus.COMPLETED
-        elif result["status"] == "PARTIAL":
-            step.status = StepStatus.COMPLETED  # Still complete but flag
-        else:
-            step.status = StepStatus.FAILED
-        
-        step.completed_at = datetime.utcnow()
-        step.score_contribution = result["score"]
-        step.input_data = {
-            "pan_number": data.pan_number.upper(),
-            "verification_result": result["details"],
-        }
-        
-        if verification.status == VerificationStatus.LINK_SENT:
-            verification.status = VerificationStatus.IN_PROGRESS
-        
-        db.commit()
-        
-        logger.info(f"PAN verification completed for verification {verification.id}: {result['status']}")
-        
-        return StepVerificationResponse(
-            step_type=StepTypeSchema.PAN,
-            status=step.status,
-            verification_result=VerificationComparisonResult(
-                status=result["status"],
-                score=result["score"],
-                message=result.get("message"),
-                details=result["details"],
-                verified_at=datetime.utcnow(),
-            ),
-            message=result.get("message", f"PAN verification {result['status'].lower()}."),
-        )
-        
-    except SurepassInvalidInputError as e:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(e),
-        )
-    except SurepassError as e:
-        logger.error(f"Surepass error in submit_pan: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="PAN verification failed. Please try again.",
-        )
+    db.commit()
+
+    return StepVerificationResponse(
+        step_type=StepTypeSchema.PAN,
+        status=StepStatusSchema.COMPLETED,
+        verification_result=VerificationComparisonResult(
+            status="PENDING",
+            score=0,
+            details={"message": "PAN stored for later verification"},
+            verified_at=None,
+        ),
+        message="PAN details stored successfully.",
+    )
+
 
 
 @router.post(
@@ -605,6 +895,41 @@ async def submit_uan(
             message="UAN already verified.",
         )
     
+    # Handle Fresher Case
+    if data.is_fresher:
+        step.status = StepStatus.SKIPPED
+        step.input_data = {
+            "is_fresher": True,
+            "uan_number": None,
+            "claimed_experience_years": 0
+        }
+        step.completed_at = datetime.utcnow()
+        step.score_contribution = 100 # Neutral/Full score as it's not applicable
+        
+        if verification.status == VerificationStatus.LINK_SENT:
+            verification.status = VerificationStatus.IN_PROGRESS
+            
+        db.commit()
+        
+        return StepVerificationResponse(
+            step_type=StepTypeSchema.UAN,
+            status=StepStatusSchema.SKIPPED,
+            verification_result=VerificationComparisonResult(
+                status="SKIPPED",
+                score=100,
+                details={"message": "Candidate is a fresher"},
+                verified_at=datetime.utcnow(),
+            ),
+            message="UAN skipped (Fresher).",
+        )
+
+    # Validate UAN if not fresher
+    if not data.uan_number:
+         raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="UAN number is required for experienced candidates.",
+        )
+
     # Get Aadhaar-verified data for identity comparison
     aadhaar_step = get_step_by_type(verification, StepType.AADHAAR)
     candidate = verification.candidate
@@ -799,57 +1124,68 @@ async def skip_step(
             message=f"Step already {step.status.value.lower()}.",
         )
     
-    step.mark_skipped()
+    step.status = StepStatus.SKIPPED
     db.commit()
     
     return StepSubmissionResponse(
         step_type=step_type_enum,
         status=StepStatusSchema.SKIPPED,
-        message=f"Step {step_type} skipped.",
+        message=f"Step skipped.",
     )
 
 
 @router.post(
     "/{token}/submit",
     response_model=VerificationSubmitResponse,
-    summary="Final submission",
-    description="Submit the verification for scoring. All mandatory steps must be completed.",
+    summary="Finalize verification submission",
 )
-async def final_submit(
+async def submit_verification(
     token: str,
     db: Session = Depends(get_db),
 ):
     """
-    Final submission of verification.
-    
-    - Validates all mandatory steps are completed
-    - Transitions status to SUBMITTED
-    - Trust score remains NULL (calculated in Phase 4)
+    Finalize the verification process.
+    Matches the user's "Consent & Submit" action.
     """
     verification = get_verification_by_token(token, db)
     
-    # Check all mandatory steps are completed
-    incomplete_mandatory = []
-    for step in verification.steps:
-        if step.is_mandatory and step.status not in [StepStatus.COMPLETED]:
-            incomplete_mandatory.append(step.step_type.value)
+    # Check if all mandatory steps are completed
+    pending_mandatory = db.query(VerificationStep).filter(
+        VerificationStep.verification_id == verification.id,
+        VerificationStep.is_mandatory == True,
+        VerificationStep.status.in_([StepStatus.PENDING, StepStatus.FAILED])
+    ).count()
     
-    if incomplete_mandatory:
-        raise HTTPException(
+    if pending_mandatory > 0:
+         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot submit: incomplete mandatory steps: {', '.join(incomplete_mandatory)}",
+            detail="Cannot submit. Mandatory steps are pending.",
         )
-    
-    # Transition to SUBMITTED
+        
+    # Update status
     verification.status = VerificationStatus.SUBMITTED
     verification.submitted_at = datetime.utcnow()
-    # trust_score remains NULL - Phase 4 will calculate it
     
+    # Run Face Comparison (deferred until submission)
+    face_step = get_step_by_type(verification, StepType.FACE_LIVENESS)
+    aadhaar_step = get_step_by_type(verification, StepType.AADHAAR)
+    
+    if (face_step.status == StepStatus.COMPLETED and face_step.input_data and 
+        aadhaar_step.status == StepStatus.COMPLETED and aadhaar_step.input_data):
+        
+        selfie_key = face_step.input_data.get("source_key")
+        reference_key = aadhaar_step.input_data.get("reference_key")
+        
+        if selfie_key and reference_key:
+            logger.info(f"Running deferred face comparison for {verification.id}")
+            # We don't await so the user doesn't wait, but for sqlite/simplicity we might have to.
+            # Using await ensures DB consistency before response.
+            await _run_face_comparison(verification, face_step, selfie_key, reference_key, db)
+
     db.commit()
-    db.refresh(verification)
     
     return VerificationSubmitResponse(
-        status=VerificationStatus.SUBMITTED,
-        message="Verification submitted successfully. Trust score will be calculated shortly.",
-        submitted_at=verification.submitted_at,
+        status=VerificationStatusSchema.SUBMITTED,
+        message="Verification submitted successfully.",
+        submitted_at=verification.submitted_at
     )

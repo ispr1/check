@@ -14,6 +14,10 @@ import re
 import logging
 import httpx
 from typing import Optional
+from dotenv import load_dotenv
+
+# Ensure environment variables are loaded
+load_dotenv()
 
 from .exceptions import (
     SurepassError,
@@ -57,10 +61,13 @@ class SurepassClient:
         ).rstrip("/")
         self.api_key = os.getenv("SUREPASS_API_KEY", "")
         
+        # LOGGING REINFORCEMENT
+        logger.info(f"[SurepassClient Init] enabled={self.enabled}, base_url={self.base_url}")
+        logger.info(f"[SurepassClient Init] api_key_length={len(self.api_key)}")
+        logger.info(f"[SurepassClient Init] environment={os.getenv('ENVIRONMENT')}")
+        
         if self.enabled and not self.api_key:
             logger.warning("SUREPASS_ENABLED=true but SUREPASS_API_KEY is not set!")
-        
-        logger.info(f"SurepassClient initialized: enabled={self.enabled}, base_url={self.base_url}")
     
     def _get_headers(self) -> dict:
         """Get request headers with authorization."""
@@ -107,7 +114,7 @@ class SurepassClient:
                     response = client.post(url, headers=self._get_headers(), json=payload)
                 
                 # Log response status
-                logger.info(f"Surepass response: {response.status_code}")
+                logger.info(f"Surepass response ({endpoint}): {response.status_code}")
                 
                 # Handle HTTP errors
                 if response.status_code == 404:
@@ -115,6 +122,7 @@ class SurepassClient:
                     logger.warning(f"Surepass endpoint not available (404): {endpoint}")
                     raise SurepassNotAvailableError(endpoint)
                 elif response.status_code == 401:
+                    logger.error(f"Surepass Auth Failed (401) for {endpoint}")
                     raise SurepassAuthError()
                 elif response.status_code == 429:
                     raise SurepassRateLimitError()
@@ -129,8 +137,12 @@ class SurepassClient:
                 
                 # Parse response
                 try:
-                    return response.json()
-                except Exception:
+                    data = response.json()
+                    if not isinstance(data, (dict, list)):
+                        logger.error(f"Surepass returned non-json-object ({type(data)}): {data}")
+                    return data
+                except Exception as e:
+                    logger.error(f"Failed to parse Surepass response: {str(e)}")
                     raise SurepassError(
                         message="Invalid JSON response from Surepass",
                         status_code=response.status_code
@@ -142,6 +154,7 @@ class SurepassClient:
                 return self._make_request(method, endpoint, payload, retry_count + 1)
             raise SurepassTimeoutError(endpoint)
         except httpx.RequestError as e:
+            logger.error(f"Surepass request failed: {str(e)}")
             raise SurepassError(message=f"Request failed: {str(e)}")
     
     def post(self, endpoint: str, payload: dict) -> dict:
@@ -156,8 +169,7 @@ class SurepassClient:
             Response data (from "data" key if present, else full response)
         """
         if not self.enabled:
-            logger.info(f"Mock mode: {endpoint}")
-            # Return None to signal mock mode - callers should handle this
+            logger.info(f"[SurepassClient] MOCK MODE ACTIVE for POST {endpoint}")
             return None
         
         response = self._make_request("POST", endpoint, payload)
@@ -170,7 +182,7 @@ class SurepassClient:
     def get(self, endpoint: str) -> dict:
         """Make GET request to Surepass API."""
         if not self.enabled:
-            logger.info(f"Mock mode: {endpoint}")
+            logger.info(f"[SurepassClient] MOCK MODE ACTIVE for GET {endpoint}")
             return None
         
         response = self._make_request("GET", endpoint)
